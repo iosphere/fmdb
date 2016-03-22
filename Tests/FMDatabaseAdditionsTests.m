@@ -9,6 +9,12 @@
 #import <XCTest/XCTest.h>
 #import "FMDatabaseAdditions.h"
 
+#if FMDB_SQLITE_STANDALONE
+#import <sqlite3/sqlite3.h>
+#else
+#import <sqlite3.h>
+#endif
+
 @interface FMDatabaseAdditionsTests : FMDBTempDBTests
 
 @end
@@ -99,6 +105,28 @@
     [[self db] setUserVersion:12];
     
     XCTAssertTrue([[self db] userVersion] == 12);
+}
+
+- (void)testApplicationID {
+#if SQLITE_VERSION_NUMBER >= 3007017
+    uint32_t appID = NSHFSTypeCodeFromFileType(NSFileTypeForHFSTypeCode('fmdb'));
+    
+    [self.db setApplicationID:appID];
+    
+    uint32_t rAppID = [self.db applicationID];
+    
+    XCTAssertEqual(rAppID, appID);
+    
+    [self.db setApplicationIDString:@"acrn"];
+    
+    NSString *s = [self.db applicationIDString];
+    
+    XCTAssertEqualObjects(s, @"acrn");
+#else
+    NSString *errorMessage = NSLocalizedString(@"Application ID functions require SQLite 3.7.17", nil);
+    XCTFail("%@", errorMessage);
+    if (self.db.logsErrors) NSLog(@"%@", errorMessage);
+#endif
 }
 
 @end

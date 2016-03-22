@@ -8,7 +8,7 @@
 
 #import "FMDatabase+FTS3.h"
 #import "fts3_tokenizer.h"
-
+#include "sqlite3.h"
 NSString *const kFTSCommandOptimize = @"optimize";
 NSString *const kFTSCommandRebuild  = @"rebuild";
 NSString *const kFTSCommandIntegrityCheck = @"integrity-check";
@@ -17,6 +17,8 @@ NSString *const kFTSCommandAutoMerge = @"automerge=%u";
 
 /* I know this is an evil global, but we need to be able to map names to implementations. */
 static NSMapTable *g_delegateMap = nil;
+
+static NSString *kDefaultTokenizerDelegateKey = @"DefaultTokenizerDelegateKey";
 
 /*
  ** Class derived from sqlite3_tokenizer
@@ -32,8 +34,6 @@ typedef struct FMDBTokenizer
  */
 static int FMDBTokenizerCreate(int argc, const char * const *argv, sqlite3_tokenizer **ppTokenizer)
 {
-    NSCParameterAssert(argc > 0);   // Check that the name of the tokenizer is set in CREATE VIRTUAL TABLE
-    
     FMDBTokenizer *tokenizer = (FMDBTokenizer *) sqlite3_malloc(sizeof(FMDBTokenizer));
     
     if (tokenizer == NULL) {
@@ -41,7 +41,13 @@ static int FMDBTokenizerCreate(int argc, const char * const *argv, sqlite3_token
     }
     
     memset(tokenizer, 0, sizeof(*tokenizer));
-    tokenizer->delegate = [g_delegateMap objectForKey:[NSString stringWithUTF8String:argv[0]]];
+
+    NSString *key = kDefaultTokenizerDelegateKey;
+    if (argc > 0) {
+        key = [NSString stringWithUTF8String:argv[0]];
+    }
+    
+    tokenizer->delegate = [g_delegateMap objectForKey:key];
     
     if (!tokenizer->delegate) {
         return SQLITE_ERROR;
@@ -90,6 +96,8 @@ static int FMDBTokenizerOpen(sqlite3_tokenizer *pTokenizer,         /* The token
     cursor->tokenString = NULL;
     cursor->userObject = NULL;
     cursor->outputBuf[0] = '\0';
+    cursor->previousRange = CFRangeMake(0, 0);
+    cursor->previousOffsetRange = CFRangeMake(0, 0);
         
     [tokenizer->delegate openTokenizerCursor:cursor];
 
@@ -140,22 +148,42 @@ static int FMDBTokenizerNext(sqlite3_tokenizer_cursor *pCursor,  /* Cursor retur
         return SQLITE_DONE;
     }
     
-    // The range from the tokenizer is in UTF-16 positions, we need give UTF-8 positions to SQLite.
-    CFIndex usedBytes1, usedBytes2;
-    CFRange range1 = CFRangeMake(0, cursor->currentRange.location);
-    CFRange range2 = CFRangeMake(0, cursor->currentRange.length);
-    
+    // The range from the tokenizer is in UTF-16 positions, we need give UTF-8 positions to SQLite
+    // Conversion to bytes is very expensive on longer strings. In order to avoid processing the same data over and over again for each token, we cache the previousRange and previousOffsetRange
+    // Not all tokenizers may process strings sequentially. Reset the cached ranges if necessary
+    if (cursor->currentRange.location < cursor->previousRange.location + cursor->previousRange.length) {
+        cursor->previousRange = CFRangeMake(0, 0);
+        cursor->previousOffsetRange = CFRangeMake(0, 0);
+    }
+
+    // First calculate the offset of current token range in original string
+    CFIndex locationOffset, lengthOffset;
+    const CFRange rangeToStartToken = CFRangeMake((cursor->previousRange.location + cursor->previousRange.length), cursor->currentRange.location - (cursor->previousRange.location + cursor->previousRange.length));
+
     // This will tell us how many UTF-8 bytes there are before the start of the token
-    CFStringGetBytes(cursor->inputString, range1, kCFStringEncodingUTF8, '?', false,
-                     NULL, 0, &usedBytes1);
-    
-    CFStringGetBytes(cursor->tokenString, range2, kCFStringEncodingUTF8, '?', false,
-                     cursor->outputBuf, sizeof(cursor->outputBuf), &usedBytes2);
+    CFStringGetBytes(cursor->inputString, rangeToStartToken, kCFStringEncodingUTF8, '?', false,
+                     NULL, 0, &locationOffset);
+    // and how many UTF-8 bytes there are within the token in the original string
+    CFStringGetBytes(cursor->inputString, cursor->currentRange, kCFStringEncodingUTF8, '?', false,
+                     NULL, 0, &lengthOffset);
+
+    // Update the location offset
+    locationOffset += (cursor->previousOffsetRange.location + cursor->previousOffsetRange.length);
+
+    // Cache the data to reuse on next token
+    cursor->previousRange = cursor->currentRange;
+    cursor->previousOffsetRange = CFRangeMake(locationOffset, lengthOffset);
+
+    // Determine how many bytes the new token string uses
+    CFIndex newBytesUsed;
+    const CFRange newTokenRange = CFRangeMake(0, CFStringGetLength(cursor->tokenString));
+    CFStringGetBytes(cursor->tokenString, newTokenRange, kCFStringEncodingUTF8, '?', false,
+                     cursor->outputBuf, sizeof(cursor->outputBuf), &newBytesUsed);
     
     *pzToken = (char *) cursor->outputBuf;
-    *pnBytes = (int) usedBytes2;
-    *piStartOffset = (int) usedBytes1;
-    *piEndOffset = (int) (usedBytes1 + usedBytes2);
+    *pnBytes = (int) newBytesUsed;
+    *piStartOffset = (int) locationOffset;
+    *piEndOffset = (int) (locationOffset + lengthOffset);
     *piPosition = cursor->tokenIndex++;
     
     return SQLITE_OK;
@@ -179,10 +207,10 @@ static const sqlite3_tokenizer_module FMDBTokenizerModule =
 
 @implementation FMDatabase (FTS3)
 
-+ (void)registerTokenizer:(id<FMTokenizerDelegate>)tokenizer withName:(NSString *)name
++ (void)registerTokenizer:(id<FMTokenizerDelegate>)tokenizer withKey:(NSString *)key
 {
     NSParameterAssert(tokenizer);
-    NSParameterAssert([name length]);
+    NSParameterAssert([key length]);
     
     static dispatch_once_t onceToken;
 
@@ -191,15 +219,20 @@ static const sqlite3_tokenizer_module FMDBTokenizerModule =
                                               valueOptions:NSPointerFunctionsWeakMemory];
     });
     
-    [g_delegateMap setObject:tokenizer forKey:name];
+    [g_delegateMap setObject:tokenizer forKey:key];
 }
 
-- (BOOL)installTokenizerModule
++ (void)registerTokenizer:(id<FMTokenizerDelegate>)tokenizer
+{
+    [self registerTokenizer:tokenizer withKey:kDefaultTokenizerDelegateKey];
+}
+
+- (BOOL)installTokenizerModuleWithName:(NSString *)name
 {
     const sqlite3_tokenizer_module *module = &FMDBTokenizerModule;
     NSData *tokenizerData = [NSData dataWithBytes:&module  length:sizeof(module)];
     
-    FMResultSet *results = [self executeQuery:@"SELECT fts3_tokenizer('fmdb', ?)", tokenizerData];
+    FMResultSet *results = [self executeQuery:@"SELECT fts3_tokenizer(?, ?)", name, tokenizerData];
     
     if ([results next]) {
         [results close];
@@ -207,6 +240,11 @@ static const sqlite3_tokenizer_module FMDBTokenizerModule =
     }
     
     return NO;
+}
+
+- (BOOL)installTokenizerModule
+{
+    return [self installTokenizerModuleWithName:@"fmdb"];
 }
 
 - (BOOL)issueCommand:(NSString *)command forTable:(NSString *)tableName
