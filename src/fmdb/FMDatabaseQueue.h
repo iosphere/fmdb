@@ -140,6 +140,7 @@
  */
 
 - (void)inDatabase:(void (^)(FMDatabase *db))block;
+- (void)inDatabase:(void (^)(FMDatabase *db))block async:(BOOL)async;
 
 /** Synchronously perform database operations on queue, using transactions.
 
