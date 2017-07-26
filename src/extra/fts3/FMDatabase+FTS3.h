@@ -6,7 +6,11 @@
 //  Copyright (c) 2014 Andrew Goodale. All rights reserved.
 //
 
+#ifdef COCOAPODS
 #import <FMDB/FMDatabase.h>
+#else
+#import "FMDatabase.h"
+#endif
 
 /**
  Names of commands that can be issued against an FTS table.
